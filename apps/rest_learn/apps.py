@@ -2,4 +2,5 @@ from django.apps import AppConfig
 
 
 class RestLearnConfig(AppConfig):
-    name = 'apps.rest_learn'
+    name = 'rest_learn'
+    verbose_name = 'RESTFUL API设计'
