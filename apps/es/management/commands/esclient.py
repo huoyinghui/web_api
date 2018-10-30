@@ -1,5 +1,5 @@
 from django.core.management.base import BaseCommand
-from es.models import ping, create_index, health, create_data
+from es.index import ping, create_index, health, create_data
 
 
 class Command(BaseCommand):
