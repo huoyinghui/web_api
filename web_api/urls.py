@@ -31,6 +31,7 @@ router.register(r'api/rest_learn', TestModeViewSet)
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api-auth/', include('rest_framework.urls', namespace='rest_framework')),
+    path('api/es/', include('es.urls', namespace='es')),
     path('api/token/', obtain_jwt_token),
     path('api/token-refresh/', refresh_jwt_token),
     path('api/token-verify/', verify_jwt_token),
