@@ -1,17 +1,21 @@
 # -*- coding:utf-8 -*-
 import os
-import threading
 import logging
 import aiohttp
 import asyncio
 import async_timeout
 import time
+import threading
 from random import random
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from threading import Lock as TLock
+from multiprocessing import Lock as PLock
+from multiprocessing import Manager
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, Future
+
 from lxml import etree
 from pyquery import PyQuery as pq
 
-from es.index import add_article
+from es.index import add_article, bulk_insert
 from es.models import Article
 
 
@@ -24,12 +28,14 @@ logging.basicConfig(
 logger = logging.getLogger('spider')
 
 ua = 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36'
+g = 0
+g_td = {}
 
 
 class MulTaskManage(object):
-
-    def __init__(self, count=0):
-        self.count = count
+    """
+    多任务类，执行多任务，屏蔽
+    """
 
     @staticmethod
     def mul_task_pool(max_workers=3, mod=0, task_dict=None):
@@ -40,13 +46,6 @@ class MulTaskManage(object):
         :param task_dict:
         :return:
 
-        with ProcessPoolExecutor(max_workers=2) as executor:
-            task1 = executor.submit(task)
-            task2 = executor.submit(task)
-
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            task1 = executor.submit(task_io)
-            task2 = executor.submit(task_io)
         """
         if not isinstance(task_dict, dict):
             return
@@ -56,34 +55,39 @@ class MulTaskManage(object):
             # future_to_data = [executor.submit(task) for task in task_list]
             for task_key, task_func in task_dict.items():
                 fn, arg, kwarg = task_func
-                print(task_key, fn, arg, kwarg)
+                logging.debug("task_key:{} fn:{} arg:{} kwarg:{}".format(task_key, fn, arg, kwarg))
                 future_task = executor.submit(fn, *arg, **kwarg)
+                # 主进程/线程完成
                 future_to_data[task_key] = future_task
-                print("future dict:", future_to_data)
-
+                logging.debug("future dict:{}".format(future_to_data))
         return future_to_data
 
 
 class Spider(object):
-    def __init__(self, count=0, queue=None, user_agent='', urls=None):
+    def __init__(self, name='', count=0, queue=None, user_agent='', urls=None):
         """
 
+        :param name:
         :param count:
         :param queue:
         :param user_agent:
         :param urls:
         """
+        self.name = name if name else 'spider'
         self.count = count
         self.queue = queue
         self.user_agent = user_agent
         self.urls = urls
         self.url_prefix = 'http://python.jobbole.com/'
+        self.data_queue_limit = 10
+        self.xpath_title_list = '//*[@id="archive"]//a[@class="archive-title"]/text()'
+        self.xpath_href_list = '//*[@id="archive"]//span[@class="read-more"]/a/@href'
+        self.query_class_detail = '.entry'
 
-    @staticmethod
-    def new_id(id_=''):
+    def new_id(self, id_=''):
         if not id_:
             return None
-        return 'jobble_{}'.format(id_)
+        return '{}_{}'.format(self.name, id_)
 
     def url_to_id(self, url=''):
         id_ = str(url)[len(self.url_prefix):].replace('/', '', -1)
@@ -94,12 +98,10 @@ class Spider(object):
         with async_timeout.timeout(10):
             async with session.get(url, headers=head) as response:
                 html_text = await response.text()
-                # file = pyquery(html_text)
                 html = etree.HTML(html_text)
-                title_list = html.xpath('//*[@id="archive"]//a[@class="archive-title"]/text()')
-                href_list = html.xpath('//*[@id="archive"]//span[@class="read-more"]/a/@href')
+                title_list = html.xpath(self.xpath_title_list)
+                href_list = html.xpath(self.xpath_href_list)
                 return dict(zip(title_list, href_list))
-                # return file('.archive-title').eq(0).text()
 
     async def fetch_detail(self, session, url):
         head = {'User-Agent': self.user_agent}
@@ -108,25 +110,27 @@ class Spider(object):
                 await asyncio.sleep(0.1)
                 html_text = await response.text()
                 file = pq(html_text)
-                return file('.entry').text()
+                return file(self.query_class_detail).text()
 
-    async def bulk_article(self, queue=None):
+    async def bulk_article(self, data_queue=None):
+            item_list = []
             while True:
-                item = await queue.get()
+                item = await data_queue.get()
                 self.count += 1
-                logger.info('cnt:{} consuming item {}...'.format(self.count, item))
+                logger.info('cnt:{} consuming item {}...bulk:{}'.format(self.count, item, len(item_list)))
                 if item is None:
-                    logging.debug('consume finish')
+                    logging.info('consume finish:{}'.format(data_queue.qsize()))
                     break
                 await asyncio.sleep(random())
-                print(item)
                 if not isinstance(item, Article):
                     continue
-                # bulk
-                item.save()
-                # add_article(id_=self.new_id(id_), title=title, body=describe, tags=[])
+                # bulk insert
+                item_list.append(item.to_dict(True))
+                if len(item_list) >= self.data_queue_limit:
+                    bulk_insert(tuple(item_list))
+                    item_list = []
 
-    async def consume(self, queue=None):
+    async def consume(self, queue=None, data_queue=None):
         async with aiohttp.ClientSession() as session:
             while True:
                 item = await queue.get()
@@ -138,8 +142,10 @@ class Spider(object):
                 await asyncio.sleep(random())
                 id_, describe_url, title = item
                 describe = await self.fetch_detail(session, describe_url)
-                add_article(title=title, body=describe, tags=[])
+                data = add_article(title=title, body=describe, tags=[])
+                await data_queue.put(data)
                 # add_article(id_=self.new_id(id_), title=title, body=describe, tags=[])
+            await data_queue.put(None)
 
     async def produce(self, queue=None):
         async with aiohttp.ClientSession() as session:
@@ -151,11 +157,11 @@ class Spider(object):
                     id_ = self.url_to_id(describe_url)
                     item = (id_, describe_url, title)
                     await queue.put(item)
-        logging.debug('produce end:', queue.qsize())
+        logging.info('produce end:', queue.qsize())
         await queue.put(None)
 
 
-async def spider_jobble():
+async def spider_job():
     urls = ['http://python.jobbole.com/category/news/page/{}/'.format(i) for i in range(1, 2)]
     spider = Spider(urls=urls, user_agent=ua)
     async with aiohttp.ClientSession() as session:
@@ -170,7 +176,51 @@ async def spider_jobble():
 
 
 def task_long_io(*args, **kwargs):
-    time.sleep(3)
+    """
+    被多个进程/或者线程并发执行
+
+    :param args:
+    :param kwargs:
+    :return:
+    """
+
+    global g
+    mod_lock = args[0]
+    if not mod_lock:
+        return
+    # g 在各个线程均可见，且共享，需要加线程锁保护
+    # g 在各个进程均独立, 修改互不影响
+    mod = kwargs.get('mod', 1)
+    print('pid:{} tid:{} mod:{} wait lock:{}'.format(os.getpid(), threading.get_ident, mod, mod_lock))
+    if mod:
+        # 多线程，全局变量共享，加锁修改
+        with mod_lock:
+            g_td[kwargs['name']+'_bf'] = g
+            print("bf pid:{} g:{} id_g:{} id_mod_lock:{} kwargs:{} td:{}".format(
+                os.getpid(), g, id(g), id(mod_lock), kwargs, g_td)
+            )
+            g = g + 1
+            time.sleep(0.05)
+            g_td[kwargs['name']+'_af'] = g
+            print("af pid:{} g:{} id_g:{} id_mod_lock:{} kwargs:{} td:{}".format(
+                os.getpid(), g, id(g), id(mod_lock), kwargs, g_td)
+            )
+    else:
+        # 多进程并行, 地址空间相互独立, 无需锁
+        # 若需要串行，则加锁, 加锁后的代码变为多进程串行
+        with mod_lock:
+            td = args[1]
+            td[kwargs['name']+'_bf'] = g
+            print("bf pid:{} g:{} id_g:{} id_mod_lock:{} kwargs:{} td:{}".format(
+                os.getpid(), g, id(g), id(mod_lock), kwargs, td)
+            )
+            g = g + 1
+            time.sleep(2)
+            td[kwargs['name']+'_af'] = g
+            print("af pid:{} g:{} id_g:{} id_mod_lock:{} kwargs:{} td:{}".format(
+                os.getpid(), g, id(g), id(mod_lock), kwargs, td)
+            )
+    print('pid:{} tid:{} task end'.format(os.getpid(), threading.get_ident()))
     return "Process:{} Thread:{} args:{} kwargs:{}".format(
         os.getpid(), threading.get_ident(), args, kwargs
     )
@@ -182,38 +232,57 @@ def main_async():
     spider = Spider(urls=urls, user_agent=ua)
     queue = asyncio.Queue(maxsize=5, loop=loop)
     producer_coro = spider.produce(queue)
-    consumer_coro = spider.consume(queue)
-    bulk_article_coro = spider.bulk_article(queue)
+    data_queue = asyncio.Queue(maxsize=5, loop=loop)
+    consumer_coro = spider.consume(queue, data_queue)
+    bulk_article_coro = spider.bulk_article(data_queue)
     try:
-        loop.run_until_complete(asyncio.gather(producer_coro, consumer_coro))
-        # loop.run_until_complete(spider_jobble())
+        loop.run_until_complete(
+            asyncio.gather(
+                producer_coro,
+                consumer_coro,
+                bulk_article_coro
+            )
+        )
+        # 单独测试
+        # loop.run_until_complete(spider_job())
     except Exception as ext:
         print(ext)
         logger.error(ext)
-    print('spider finish')
+    logging.info('spider finish')
 
 
 def main_sync():
+    task_dict = {}
+    # n = 2, 4, 6, 8, 10
+    # worker = 2
+    # 执行次数=n/worker, 每一批的worker在
+    mul_task_num = 2
+    mod = 0
+    t_lock = TLock()
+    p_lock = PLock()
+    p_m_lock = Manager().Lock()
+    td = Manager().dict()
+    print(id(t_lock), id(p_lock), id(p_m_lock), id(td), os.getpid())
+    for i in range(mul_task_num):
+        task_key = 'task_{}'.format(i)
+        fn = task_long_io
+        lock = t_lock if mod else p_m_lock
+        args = (lock, td)
+        kwargs = dict(name="name_{}".format(i), mod=mod)
+        task_dict[task_key] = (fn, args, kwargs)
+
     future_data_dict = MulTaskManage.mul_task_pool(
-        max_workers=3,
-        mod=0,
-        task_dict=dict(
-            zip(
-                ["{}".format(i) for i in range(3)],
-                [
-                    (task_long_io, (1, 2, 3), dict(name='hello1')),
-                    (task_long_io, (11, 22, 33), dict(name='hello2')),
-                    (task_long_io, (111, 222, 333), dict(name='hello3')),
-                ]
-            )
-        )
+        max_workers=2,
+        mod=mod,
+        task_dict=task_dict
     )
     # 获取结果
     for task_key, task_future in future_data_dict.items():
-        from concurrent.futures import Future
         if not isinstance(task_future, Future):
             continue
-        print(task_key, task_future, task_future.result(timeout=None))
+        logging.info("task_key:{} future:{} task_fn_return:{}".format(
+            task_key, task_future, task_future.result(timeout=None))
+        )
 
 
 def main():

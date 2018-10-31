@@ -1,6 +1,7 @@
 # -*- coding:utf-8 -*-
 from datetime import datetime, timezone
 from elasticsearch_dsl.index import Index
+from elasticsearch.helpers import bulk
 
 from .models import Article, BlogLive, Danmu, client
 
@@ -80,3 +81,22 @@ def init_test_data():
         elif base % 3 == 2:
             add_article(base+4, 'Python very quickly', 'Python very quickly', ['python'])
             add_article(base+5, 'Django', 'Python Web framework', ['python', 'django'])
+
+
+def gendata():
+    mywords = ['foo', 'bar', 'baz']
+    for word in mywords:
+        yield add_article(title=word, body=word).to_dict(True)
+        # yield {
+        #     "_index": "mywords",
+        #     "_type": "document",
+        #     "doc": {"word": word},
+        # }
+
+
+def bulk_insert(actions=None):
+    if not actions:
+        actions = gendata()
+    ret = bulk(client, actions)
+    print('bulk_insert', ret)
+    return ret

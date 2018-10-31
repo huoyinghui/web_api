@@ -1,5 +1,5 @@
 from django.core.management.base import BaseCommand
-from es.index import ping, create_index, health, create_data, IndexDict, delete_index
+from es.index import ping, create_index, health, create_data, IndexDict, delete_index, bulk_insert
 
 
 class Command(BaseCommand):
@@ -53,3 +53,4 @@ class Command(BaseCommand):
         if hasattr(spider, 'run'):
             ret = spider.run()
             self.stdout.write(ret)
+        bulk_insert()
